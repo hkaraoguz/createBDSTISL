@@ -3,6 +3,14 @@
 #include "database/databasemanager.h"
 #include "bdst.h"
 #include "Utility.h"
+
+
+
+/*#include <opencv2/core/core.hpp>
+#include <opencv2/highgui/highgui.hpp>*/
+#include <opencv2/ml/ml.hpp>
+
+
 #include <ros/ros.h>
 #include <std_msgs/String.h>
 #include <sensor_msgs/Image.h>
@@ -12,13 +20,14 @@
 #include <vector>
 #include <algorithm>
 #include <numeric>
+
+
+
 #include <QDir>
 #include <QDebug>
 #include <QFile>
+#include <QDateTime>
 #include <sys/sysinfo.h>
-#include <opencv2/core/core.hpp>
-#include <opencv2/highgui/highgui.hpp>
-#include <opencv2/ml/ml.hpp>
 
 #include <stdio.h>
 #include <stdlib.h>  /* The standard C libraries */
@@ -26,13 +35,30 @@ extern "C" {
 #include "cluster.h"
 }
 
-/*  TODO: place detect edildiginde o place i okuyup agaca ekleme, agac yoksa olusturma ve merging kismi    */
-/* Place leri db den okuma, bdst bottom up recognition*/
+/*  YAPILDI place detect edildiginde o place i okuyup agaca ekleme, agac yoksa olusturma ve merging kismi    */
+/* YAPILDI Place leri db den okuma, bdst bottom up recognition*/
 /* YAPILDI bdst level connection index de maximum u bulma. Bu zaten oradaki en ust baglantiyi temsil ediyor*/
-/* Cost function u yaratma. Cost Function hesaplama kismi*/
-/* Previous place in agacta nerede oldugunu bulup oradan search e baslamak*/
+/* YAPILDI Cost function u yaratma. Cost Function hesaplama kismi*/
+/* YAPILDI: Previous place in agacta nerede oldugunu bulup oradan search e baslamak*/
 
 #define MIN_NO_PLACES 3
+
+using namespace std;
+using namespace cv;
+
+
+#ifndef max
+#define max(a,b) (((a) > (b)) ? (a) : (b))
+#endif
+#ifndef min
+#define min(a,b) (((a) < (b)) ? (a) : (b))
+#endif
+
+
+#undef max
+#undef min
+
+
 
 // A typedef for sorting places based on their distance and index
 typedef std::pair<float,int> mypair;
@@ -63,12 +89,24 @@ double** calculateDistanceMatrix(int nrows, int ncols, double** data, int** mask
 // Calculates the cost function based on the first closest, second closest as well as the SVM results
 float calculateCostFunction(float firstDistance, float secondDistance, Place closestPlace, Place detected_place);
 
+float calculateCostFunctionv3(float firstDistance, float secondDistance, Place closestPlace, Place detected_place);
+
+
+// Train the SVM classifier
+void trainSVM();
+
 // Perform the one-Class SVM calculation
 float performSVM(Mat trainingVector, Mat testVector);
 
+// Perform kNN classification between first and second closest places
+float performKNN(Mat trainingVector, Mat secondtrainingVector, Mat testVector);
+
+float calculateCostFunctionv2(float firstDistance, float secondDistance, Place closestPlace, Place secondClosestPlace, Place detected_place);
+
+// Perform the BDST operations for creating the BDST
 void performBDSTCalculations();
 
-// Calculate the binary bdst
+// Calculate the Binary BDST
 Node* calculateBinaryBDST(int nrows, int ncols, double** data);
 
 // Binary den Merged bdst'ye gecis
@@ -78,6 +116,8 @@ void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST
 void calculateMeanInvariantsOfBDST(BDST* aLevel);
 
 int performTopDownBDSTRecognition(float tau_g, float tau_l, BDST* bdst, Place detected_place);
+
+int performBottomUpBDSTRecognition(float tau_g, float tau_l, BDST* bdst, Place detected_place);
 
 //double calculateLevelCostFunction(Place place, std::vector<double> closestMeanInvariant, std::vector<double> secondClosestMeanInvariant, float voteRate);
 
@@ -89,7 +129,7 @@ double compareHistHK( InputArray _H1, InputArray _H2, int method );
 // FOR debugging
 std::vector< std::vector<float> > readInvariantVectors();
 
-void trainSVM();
+
 
 
 /*class UninformativeFrame
@@ -103,15 +143,7 @@ public:
 
 };
 UninformativeFrame*/
-TemporalWindow::TemporalWindow()
-{
-    startPoint = 0;
-    endPoint = 0;
-    tau_w = 0;
-    tau_n = 0;
-    id = -1;
 
-}
 
 ros::Timer timer;
 
@@ -134,6 +166,15 @@ DatabaseManager dbmanager;
 DatabaseManager knowledgedbmanager;
 
 int lastTopMapNodeId;
+
+QString mainFilePath;
+
+std::vector<Place> currentPlaces;
+
+
+double tau_h, tau_r;
+int tau_l;
+
 
 void constructInvariantsMatrix(std::vector<LearnedPlace> plcs)
 {
@@ -159,12 +200,13 @@ void updateTopologicalMap(int node1, int node2)
     topmap.connections.push_back(mapNode);
 
 
+    // Iliskiyi topolojik haritaya yazdir
     knowledgedbmanager.insertTopologicalMapRelation(topmap.connections.size(),mapNode);
 
-    // DB'YE ILISKI YAZILACAK
+
 
 }
-
+// Detected Place i Learned Place e ekle
 LearnedPlace convertPlacetoLearnedPlace(Place place)
 {
     LearnedPlace aplace;
@@ -195,33 +237,100 @@ LearnedPlace convertPlacetoLearnedPlace(Place place)
     return aplace;
 }
 
+QFile file;
+QTextStream strm;
+// Callback for place detection
 void placeCallback(std_msgs::Int16 placeId)
 {
-    currentPlace = dbmanager.getPlace((int)placeId.data);
+
+    Place aPlace = dbmanager.getPlace((int)placeId.data);
+
+    //  currentPlace = dbmanager.getPlace((int)placeId.data);
 
     if(places.size() < MIN_NO_PLACES && places.size() >= 1)
     {
-        updateTopologicalMap(places.back().id,currentPlace.id);
+        updateTopologicalMap(places.back().id,aPlace.id);
     }
 
     if(places.size() < MIN_NO_PLACES)
     {
-        LearnedPlace alearnedPlace = convertPlacetoLearnedPlace(currentPlace);
+        qint64 starttime = QDateTime::currentMSecsSinceEpoch();
+
+        LearnedPlace alearnedPlace = convertPlacetoLearnedPlace(aPlace);
         places.push_back(alearnedPlace);
         qDebug()<<"Places size"<<places.size();
         return;
 
+        qint64 stoptime = QDateTime::currentMSecsSinceEpoch();
+
+        qDebug()<<(float)(stoptime-starttime);
+
+        if(strm.device() != NULL)
+            strm<<(float)(stoptime-starttime)<<"\n";
+
     }
 
+    currentPlaces.push_back(aPlace);
 
     // places.push_back(aPlace);
-    qDebug()<<"Places size"<<places.size();
+    // qDebug()<<"Places size"<<places.size();
 
     performRecognition = true;
 
 }
 
 
+
+void mainFilePathCallback(std_msgs::String mainfp)
+{
+    std::string tempstr = mainfp.data;
+
+    mainFilePath = QString::fromStdString(tempstr);
+
+    qDebug()<<"Main File Path Callback received"<<mainFilePath;
+
+    QString detected_places_dbpath = mainFilePath;
+
+    detected_places_dbpath.append("/detected_places.db");
+
+    QString knowledge_dbpath = mainFilePath;
+
+    knowledge_dbpath.append("/knowledge.db");
+
+    if(dbmanager.openDB(detected_places_dbpath))
+    {
+        qDebug()<<"Places db opened";
+    }
+
+    if(knowledgedbmanager.openDB(knowledge_dbpath,"knowledge"))
+    {
+        qDebug()<<"Knowledge db opened";
+    }
+
+    QString processingPerImageFilePath = mainFilePath;
+
+    processingPerImageFilePath = processingPerImageFilePath.append("/undperImage.txt");
+
+    file.setFileName(processingPerImageFilePath);
+
+    if(file.open(QFile::WriteOnly))
+    {
+        qDebug()<<"Understanding per Image file Path has been opened";
+        strm.setDevice(&file);
+
+    }
+
+
+
+}
+bool checkIfFirst(Place aPlace)
+{
+    if(currentPlace.id == aPlace.id)
+        return true;
+
+    return false;
+
+}
 
 int main (int argc, char** argv)
 {
@@ -230,7 +339,18 @@ int main (int argc, char** argv)
     ros::NodeHandle nh;
     ros::NodeHandle pnh("~");
 
+    tau_h = 0.1;
+   // tau_r = 1.8;
+    tau_l = 2;
+    tau_r = 1.5;
+
+    pnh.getParam("tau_h",tau_h);
+    pnh.getParam("tau_r",tau_r);
+    pnh.getParam("tau_l",tau_l);
+    qDebug()<<"Parameters"<<tau_h<<tau_r<<tau_l;
+
     ros::Subscriber sbc = nh.subscribe<std_msgs::Int16>("placeDetectionISL/placeID",5, placeCallback);
+    ros::Subscriber filepathsubscriber = nh.subscribe<std_msgs::String>("placeDetectionISL/mainFilePath",2,mainFilePathCallback);
 
     //  QFile file("/home/hakan/ros_workspace/createBDSTISL/invariants.txt");
 
@@ -241,12 +361,12 @@ int main (int argc, char** argv)
       const int ncols = 600;
       double** data = new double*[nrows];
      int** mask = new int*[nrows];*/
-
+    /*********************************************************************************************************************/
+    // For performing debugging through getting invariants from Matlab and putting it into the text file invariant3.txt
     //   invariants = readInvariantVectors();
 
-    // performBDSTCalculations();
-
     //  performBDSTCalculations();
+    /********************************************************************************************************************/
 
 
     //  std::vector<float> resultt = invariants[0]+invariants[1];
@@ -269,7 +389,7 @@ int main (int argc, char** argv)
     ros::Rate loop(50);
 
 
-    if(dbmanager.openDB("/home/hakan/Development/ISL/Datasets/Own/deneme/db1.db"))
+    /*  if(dbmanager.openDB("/home/hakan/Development/ISL/Datasets/Own/deneme/db1.db"))
     {
         qDebug()<<"Places db opened";
     }
@@ -277,7 +397,7 @@ int main (int argc, char** argv)
     if(knowledgedbmanager.openDB("/home/hakan/Development/ISL/Datasets/Own/deneme/knowledge.db","knowledge"))
     {
         qDebug()<<"Knowledge db opened";
-    }
+    }*/
 
 
     //  trainSVM();
@@ -313,22 +433,28 @@ int main (int argc, char** argv)
 
 
 
+
     //timer.start();
 
     while(ros::ok())
     {
 
-
         ros::spinOnce();
 
-        if(places.size() >= MIN_NO_PLACES && performRecognition)
+        if(places.size() >= MIN_NO_PLACES && performRecognition && currentPlaces.size() > 0)
         {
+            qint64 starttime = QDateTime::currentMSecsSinceEpoch();
             performRecognition = false;
+
+            currentPlace = currentPlaces[0];
+
+            currentPlaces.erase(std::remove_if(currentPlaces.begin(), currentPlaces.end(), checkIfFirst), currentPlaces.end());
 
             // Do we have a bdst?
             if(bdst)
             {
-                int result = performTopDownBDSTRecognition(1.25,2,bdst,currentPlace);
+                int result = performTopDownBDSTRecognition(tau_r,2,bdst,currentPlace);
+               // int result= performBottomUpBDSTRecognition(tau_r,tau_l,bdst,currentPlace);//performTopDownBDSTRecognition(1.25,2,bdst,currentPlace);
                 qDebug()<<"Recognized state"<<result;
 
                 // We didn't recognize
@@ -336,15 +462,16 @@ int main (int argc, char** argv)
                 {
 
                     // Place lastPlace = places.back();
-                    LearnedPlace lastlearnedplace = places.back();
+                    //  LearnedPlace lastlearnedplace = places.back();
 
                     LearnedPlace anewLearnedPlace = convertPlacetoLearnedPlace(currentPlace);
 
-                    updateTopologicalMap(lastTopMapNodeId,currentPlace.id);
+                    updateTopologicalMap(lastTopMapNodeId,anewLearnedPlace.id);
 
                     places.push_back(anewLearnedPlace);
 
                     constructInvariantsMatrix(places);
+
                     performBDSTCalculations();
                 }
                 else
@@ -394,35 +521,60 @@ int main (int argc, char** argv)
 
 
                 }
+
+                qint64 stoptime = QDateTime::currentMSecsSinceEpoch();
+
+                qDebug()<<(float)(stoptime-starttime);
+
+                if(strm.device() != NULL)
+                    strm<<(float)(stoptime-starttime)<<"\n";
             }
 
 
         }
         else if(places.size() >= MIN_NO_PLACES)
         {
+
             // We have enough places, we should generate the bdst
             if(!bdst)
             {
+                 qint64 starttime = QDateTime::currentMSecsSinceEpoch();
                 constructInvariantsMatrix(places);
                 performBDSTCalculations();
                 performRecognition = false;
+                qint64 stoptime = QDateTime::currentMSecsSinceEpoch();
+
+                qDebug()<<(float)(stoptime-starttime);
+
+                if(strm.device() != NULL)
+                    strm<<(float)(stoptime-starttime)<<"\n";
             }
+
+
         }
 
         loop.sleep();
 
     }
 
+    if(bdst)
+    {
+        for(int i = 0 ; i < bdst->levels.size(); i++)
+        {
+            knowledgedbmanager.insertBDSTLevel(i+1,bdst->levels[i]);
+        }
+    }
 
 
     //  timer.stop();
 
+    file.close();
     dbmanager.closeDB();
 
     ros::shutdown();
 
     if(bdst)
-    bdst->deleteLater();
+        bdst->deleteLater();
 
     //  qDebug()<<mt.rows;
 
@@ -474,7 +626,7 @@ void performBDSTCalculations()
 
     bdst =  new BDST;
 
-    calculateMergedBDST(0.25,nrows-1,nrows,binarytree,bdst);
+    calculateMergedBDST(tau_h,nrows-1,nrows,binarytree,bdst);
 
     free(binarytree);
 
@@ -612,7 +764,12 @@ void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST
 
     std::vector<TreeLeaf> leaves;
 
-    QString homepath = QDir::homePath();
+    QString homepath = mainFilePath;
+
+    if(homepath.isEmpty())
+    {
+        homepath = QDir::homePath();
+    }
 
     homepath.append("/mergedbdst.txt");
 
@@ -649,6 +806,7 @@ void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST
 
         // The value of the leaf
         leaf.val = tree[i].distance;
+        // qDebug()<<"Tree distance"<<leaf.val;
 
         // While building merged BDST we check whether the leaf is used or not
         leaf.isused = false;
@@ -664,8 +822,9 @@ void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST
     for(uint i = 0; i < leaves.size(); i++)
     {
         TreeLeaf aLeaf = leaves[i];
+        qDebug()<<"Leaf"<<aLeaf.left<<aLeaf.right<<aLeaf.isused;
 
-        qDebug()<<"i is"<<i;
+        // qDebug()<<"i is"<<i;
 
         if(!aLeaf.isused)
         {
@@ -674,6 +833,7 @@ void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST
 
             // TODO
             qDebug()<<"Lastly i am here"<<bdst->levels.size();
+
             if(bdst->levels.size() > 0)
             {
                 for(uint j = 0 ; j< bdst->levels.size(); j++)
@@ -710,7 +870,7 @@ void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST
                             }
 
                             if(aLeaf.right < noplaces && aLeaf.left < noplaces)
-                             txtstr<<aLeaf.left+1<<" "<<aLeaf.right+1<<" "<<bdst->levels[j].val<<" "<<"\n";
+                                txtstr<<aLeaf.left+1<<" "<<aLeaf.right+1<<" "<<bdst->levels[j].val<<" "<<"\n";
                             else if(aLeaf.right < noplaces)
                                 txtstr<<aLeaf.left<<" "<<aLeaf.right+1<<" "<<bdst->levels[j].val<<" "<<"\n";
                             else if(aLeaf.left < noplaces)
@@ -745,14 +905,16 @@ void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST
                 aLevel.members.push_back(aLeaf.right);
 
                 if(aLeaf.right < noplaces && aLeaf.left < noplaces)
-                 txtstr<<aLeaf.left+1<<" "<<aLeaf.right+1<<" "<<aLevel.val+tau_h<<" "<<"\n";
+                    txtstr<<aLeaf.left+1<<" "<<aLeaf.right+1<<" "<<aLeaf.val+tau_h<<" "<<"\n";
                 else if(aLeaf.right < noplaces)
-                    txtstr<<aLeaf.left<<" "<<aLeaf.right+1<<" "<<aLevel.val+tau_h<<" "<<"\n";
+                    txtstr<<aLeaf.left<<" "<<aLeaf.right+1<<" "<<aLeaf.val+tau_h<<" "<<"\n";
                 else if(aLeaf.left < noplaces)
-                    txtstr<<aLeaf.left+1<<" "<<aLeaf.right<<" "<<aLevel.val+tau_h<<" "<<"\n";
+                    txtstr<<aLeaf.left+1<<" "<<aLeaf.right<<" "<<aLeaf.val+tau_h<<" "<<"\n";
+                else
+                    txtstr<<aLeaf.left<<" "<<aLeaf.right<<" "<<aLeaf.val+tau_h<<" "<<"\n";
 
 
-           //     txtstr<<aLeaf.left+1<<" "<<aLeaf.right+1<<" "<<aLevel.val+tau_h<<"\n";
+                //     txtstr<<aLeaf.left+1<<" "<<aLeaf.right+1<<" "<<aLevel.val+tau_h<<"\n";
 
                 aLevel.parentNodes.push_back(aLeaf.parentConnection);
 
@@ -829,9 +991,143 @@ void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST
 
 
                     }
+                    // There is no connection index in this leaf. We should investigate further
+                    else if(!leaves[j].isused  && leaves.at(j).val <= aLevel.val)
+                    {
+                        for(uint ll = j+1; ll < leaves.size(); ll++ )
+                        {
+                            // If we find the connection leaf
+                            if(leaves[j].parentConnection == leaves[ll].right && currentConnection == leaves[ll].left)
+                            {
+                                if(leaves[ll].val <= aLevel.val)
+                                {
+                                    if(leaves[j].left < noplaces &&  leaves[j].right < noplaces)
+                                    {
+                                        aLevel.members.push_back(leaves[j].left);
+                                        aLevel.members.push_back(leaves[j].right);
+
+                                        txtstr<<leaves[j].left+1<<" "<<leaves[j].right+1<<" "<<aLevel.val<<"\n";
+
+                                    }
+
+                                    else if(leaves[j].left > noplaces &&  leaves[j].right > noplaces)
+                                    {
+                                        aLevel.parentNodes.push_back(leaves[j].left);
+                                        aLevel.parentNodes.push_back(leaves[j].right);
+
+                                        txtstr<<leaves[j].left<<" "<<leaves[j].right<<" "<<aLevel.val<<"\n";
+
+
+
+                                    }
+
+                                    else if(leaves[j].left < noplaces)
+                                    {
+                                        aLevel.members.push_back(leaves[j].left);
+
+
+                                        txtstr<<leaves[j].left+1<<" "<<leaves[j].right<<" "<<aLevel.val<<"\n";
+
+
+                                    }
+                                    else if(leaves[j].left >= noplaces)
+                                    {
+                                        aLevel.parentNodes.push_back(leaves[j].left);
+                                        aLevel.members.push_back(leaves[j].right);
+
+
+                                        txtstr<<leaves[j].left<<" "<<leaves[j].right+1<<" "<<aLevel.val<<"\n";
+
+
+                                    }
+
+
+                                    txtstr<<leaves[ll].left<<" "<<leaves[ll].right<<" "<<aLevel.val<<"\n";
+
+                                    leaves[ll].isused = true;
+                                    leaves[j].isused = true;
+                                    currentConnection = leaves[ll].parentConnection;
+
+                                    break;
+
+
+                                }
+                                else
+                                {
+                                    leaves[j].isused = false;
+                                    break;
+                                }
+                            }
+                            // If we find the connection leaf
+                            else if(leaves[j].parentConnection == leaves[ll].left && currentConnection == leaves[ll].right)
+                            {
+                                if(leaves[ll].val <= aLevel.val)
+                                {
+                                    if(leaves[j].left < noplaces &&  leaves[j].right < noplaces)
+                                    {
+                                        aLevel.members.push_back(leaves[j].left);
+                                        aLevel.members.push_back(leaves[j].right);
+
+                                        txtstr<<leaves[j].left+1<<" "<<leaves[j].right+1<<" "<<aLevel.val<<"\n";
+
+                                    }
+
+                                    else if(leaves[j].left > noplaces &&  leaves[j].right > noplaces)
+                                    {
+                                        aLevel.parentNodes.push_back(leaves[j].left);
+                                        aLevel.parentNodes.push_back(leaves[j].right);
+
+                                        txtstr<<leaves[j].left<<" "<<leaves[j].right<<" "<<aLevel.val<<"\n";
+
+
+
+                                    }
+
+                                    else if(leaves[j].left < noplaces)
+                                    {
+                                        aLevel.members.push_back(leaves[j].left);
+
+
+                                        txtstr<<leaves[j].left+1<<" "<<leaves[j].right<<" "<<aLevel.val<<"\n";
+
+
+                                    }
+                                    else if(leaves[j].left >= noplaces)
+                                    {
+                                        aLevel.parentNodes.push_back(leaves[j].left);
+                                        aLevel.members.push_back(leaves[j].right);
+
+
+                                        txtstr<<leaves[j].left<<" "<<leaves[j].right+1<<" "<<aLevel.val<<"\n";
+
+
+                                    }
+
+                                    txtstr<<leaves[ll].left<<" "<<leaves[ll].right<<" "<<aLevel.val<<"\n";
+
+                                    leaves[ll].isused = true;
+                                    leaves[j].isused = true;
+                                    currentConnection = leaves[ll].parentConnection;
+
+                                    break;
+
+
+                                }
+                                else
+                                {
+                                    leaves[j].isused = false;
+                                    break;
+                                }
+
+                            }
+                        }
+
+
+
+                    }
                     else if(leaves.at(j).val > aLevel.val)
                     {
-                        leaves.at(j).isused = false;
+                        leaves[j].isused = false;
                         //  j = j-1;
                         break;
 
@@ -987,6 +1283,288 @@ void trainSVM()
 }
 static inline float computeSquare (float x) { return x*x; }
 
+int performBottomUpBDSTRecognition(float tau_g, float tau_l, BDST *bdst, Place detected_place)
+{
+    Level currentLevel;
+    int levelCount = 0;
+
+    std::vector<int> visitedNodes;
+
+    /** In topological map places start from 1, in bdst they start from 0 **/
+    int previousPlaceID = lastTopMapNodeId;
+
+    previousPlaceID -=1;
+    /** *******************************************************************/
+
+    int currentLevelCount = 0;
+
+    // qDebug()<<detected_place.memberIds.at<uint>(1,0);
+
+    /**  *********** We should find the level of the previous children ******************/
+
+    for(int i = 0; i < bdst->levels.size(); i++)
+    {
+        bool isfound = false;
+
+        for(int j = 0; j< bdst->levels[i].members.size(); j++)
+        {
+
+            if(previousPlaceID == bdst->levels[i].members[j])
+            {
+                currentLevel = bdst->levels[i];
+                currentLevelCount = i;
+                isfound = true;
+                break;
+            }
+        }
+
+        if(isfound)
+            break;
+
+    }
+
+    /** ********************************************************************************/
+    // We are going from bottom to up
+    while(1)
+    {
+
+        std::vector< mypair> distpairs;
+        mypair distpair;
+
+        // qDebug()<<"Current Level member size "<<currentLevel.members.size();
+
+        /** For each member of the current level we calculate the distances **/
+        for(uint k = 0; k < currentLevel.members.size(); k++)
+        {
+            // Get the member number
+            int aMember = currentLevel.members.at(k);
+
+            float sum_of_elems = 0;
+
+            std::vector<float> invariant;
+
+            // If the member is a terminal node
+            if(aMember < invariants.size())
+                invariant = invariants.at(aMember);
+
+            // If it is not a terminal node, we should get the mean Invariant
+            else
+            {
+                for(uint j = 0; j < bdst->levels.size(); j++)
+                {
+                    if(bdst->levels.at(j).connectionIndex == aMember)
+                    {
+                        invariant = bdst->levels.at(j).meanInvariant;
+                        break;
+                    }
+                }
+            }
+
+            // We get the place's mean invariant and transform to an std::vector
+            std::vector<float>  placeInvariant = detected_place.meanInvariant;
+
+            // This is the result string
+            std::vector<float> result;
+
+            // Now we take the difference between the member and detected place invariant
+            std::transform(invariant.begin(),invariant.end(), placeInvariant.begin(),
+                           std::back_inserter(result),
+                           std::minus<float>());
+
+            // Now we get the square of the result to eliminate minuses
+            std::transform(result.begin(), result.end(), result.begin(), computeSquare);
+
+            // We are summing the elements of the result
+            sum_of_elems =std::accumulate(result.begin(),result.end(),0.0);//#include <numeric>
+
+            sum_of_elems = sqrt(sum_of_elems);
+
+            // We now take the square root
+            // std::transform(result.begin(), result.end(), result.begin(), (float(*)(float)) sqrt);
+
+
+            // We are now collecting the difference and the indexes
+            distpair.first = sum_of_elems;
+            distpair.second = aMember;
+
+            distpairs.push_back(distpair);
+
+            //   qDebug()<<"result"<<sum_of_elems;
+
+        }
+
+        // Now we are sorting in ascending order the distance and member pairs
+        std::sort(distpairs.begin(),distpairs.end(),comparator);
+
+        // We find the closest and second closest members
+        mypair firstClosestMember = distpairs.at(0);
+        mypair secondClosestMember = distpairs.at(1);
+
+        // If it is not a terminal node, then we should go one level down
+        if(firstClosestMember.second >= invariants.size())
+        {
+            bool isvisited = false;
+
+            for(int j = 0; j < visitedNodes.size(); j++)
+            {
+                if(firstClosestMember.second == visitedNodes[j])
+                {
+                    isvisited =true;
+
+                    if(levelCount < tau_l)
+                    {
+                        bool isfound = false;
+
+                        for(uint kl = currentLevelCount+1; kl < bdst->levels.size(); kl++)
+                        {
+                            for(uint l = 0; l < bdst->levels[kl].members.size(); l++)
+                            {
+                                if(bdst->levels.at(kl).members.at(l) == currentLevel.connectionIndex)
+                                {
+                                    visitedNodes.push_back(currentLevel.connectionIndex);
+                                    currentLevel = bdst->levels[kl];
+                                    qDebug()<<"Going one level up"<<"new level is"<<currentLevel.val;
+                                    levelCount++;
+                                    currentLevelCount = kl;
+                                    isfound = true;
+                                    break;
+                                }
+                            }
+
+                            if(isfound)
+                                break;
+                        }
+
+                        if(!isfound)
+                        {
+                            qDebug()<<"Not Recognized!!";
+                            return -1;
+
+                        }
+
+                    }
+                    else{
+
+                        qDebug()<<"Not Recognized!!";
+
+                        return -1;
+                    }
+
+                }
+
+                if(isvisited)
+                    break;
+
+            }
+
+            if(!isvisited)
+            {
+
+                for(uint j = 0; j < bdst->levels.size(); j++)
+                {
+                    if(bdst->levels.at(j).connectionIndex == firstClosestMember.second)
+                    {
+                        currentLevel = bdst->levels.at(j);
+                        break;
+                    }
+                }
+
+            }
+        }
+        // We have found the closest terminal node, now we should calculate the cost function and check if it is recognized
+        else
+        {
+            qDebug()<<"Closest terminal node"<<firstClosestMember.second;
+            qDebug()<<"Second closest terminal node"<<secondClosestMember.second;
+
+            //  if(dbmanager.openDB("/home/hakan/Development/ISL/Datasets/Own/deneme/db1.db"))
+            //   {
+            Place aPlace = dbmanager.getPlace((firstClosestMember.second+1));
+            Place aPlace2 = dbmanager.getPlace((secondClosestMember.second+1));
+
+            float costValue =  calculateCostFunctionv2(firstClosestMember.first,secondClosestMember.first,aPlace,aPlace2,detected_place);
+
+            // float costValue =  calculateCostFunction(firstClosestMember.first,secondClosestMember.first,aPlace,detected_place);
+
+            if(costValue <= tau_g)
+            {
+                qDebug()<<"Recognized";
+                return firstClosestMember.second;
+            }
+            // We should check if we can go further up otherwise we should check if we can go top-down
+            else
+            {
+                if(levelCount < tau_l)
+                {
+                    bool isfound = false;
+                    for(uint j = currentLevelCount+1; j < bdst->levels.size(); j++)
+                    {
+                        for(uint l = 0; l < bdst->levels[j].members.size(); l++)
+                        {
+                            if(bdst->levels.at(j).members.at(l) == currentLevel.connectionIndex)
+                            {
+                                visitedNodes.push_back(currentLevel.connectionIndex);
+                                currentLevel = bdst->levels[j];
+                                qDebug()<<"Going one level up"<<"new level is"<<currentLevel.val;
+                                levelCount++;
+                                currentLevelCount = j;
+                                isfound = true;
+                                break;
+                            }
+                        }
+
+                        if(isfound)
+                            break;
+                    }
+
+                    if(!isfound)
+                    {
+                        qDebug()<<"Not Recognized!!";
+                        return -1;
+
+                    }
+
+                }
+                else{
+
+                    qDebug()<<"Not Recognized!!";
+
+                    return -1;
+                }
+
+            }
+
+
+
+            //   qDebug()<<aPlace.memberInvariants.rows<<aPlace.memberInvariants.cols;
+
+            //      performSVM(aPlace.memberInvariants,aPlace.memberInvariants);
+
+            //     DatabaseManager::closeDB();
+
+            //  break;
+
+            // }
+
+
+
+        }
+        //    std::vector<double> levelMemberInvariant = bdst->levels.at(j).
+
+
+
+        //  }
+
+
+
+
+    }
+
+
+    return -1;
+
+}
+
 int performTopDownBDSTRecognition(float tau_g, float tau_l, BDST *bdst, Place detected_place)
 {
     Level currentLevel;
@@ -1064,7 +1642,7 @@ int performTopDownBDSTRecognition(float tau_g, float tau_l, BDST *bdst, Place de
 
             distpairs.push_back(distpair);
 
-            qDebug()<<"result"<<sum_of_elems;
+            qDebug()<<"Distance result: "<<sum_of_elems<<aMember;
 
         }
 
@@ -1097,9 +1675,20 @@ int performTopDownBDSTRecognition(float tau_g, float tau_l, BDST *bdst, Place de
 
             //  if(dbmanager.openDB("/home/hakan/Development/ISL/Datasets/Own/deneme/db1.db"))
             //   {
+
             Place aPlace = dbmanager.getPlace((firstClosestMember.second+1));
 
-            float costValue =  calculateCostFunction(firstClosestMember.first,secondClosestMember.first,aPlace,detected_place);
+            float costValue = 100.0;
+
+            if(secondClosestMember.second < invariants.size())
+            {
+
+                Place aPlace2 = dbmanager.getPlace((secondClosestMember.second+1));
+                costValue = calculateCostFunctionv3(firstClosestMember.first,secondClosestMember.first,aPlace,detected_place);
+               // costValue = calculateCostFunctionv2(firstClosestMember.first,secondClosestMember.first,aPlace,aPlace2,detected_place);
+            }
+            else
+                costValue =  calculateCostFunctionv3(firstClosestMember.first,secondClosestMember.first,aPlace,detected_place);
 
             if(costValue <= tau_g)
             {
@@ -1303,7 +1892,7 @@ float calculateCostFunction(float firstDistance, float secondDistance, Place clo
     //  {
     // Place aPlace = DatabaseManager::getPlace(closestPlace.id);
 
-    votePercentage= performSVM(closestPlace.memberInvariants,detected_place.memberInvariants);
+    //  votePercentage= performKNN(closestPlace.memberInvariants,detected_place.memberInvariants);//performSVM(closestPlace.memberInvariants,detected_place.memberInvariants);
     qDebug()<<"Vote percentage"<<votePercentage;
 
     //  Mat trainingVector;
@@ -1322,6 +1911,153 @@ float calculateCostFunction(float firstDistance, float secondDistance, Place clo
 
 
 }
+float calculateCostFunctionv3(float firstDistance, float secondDistance, Place closestPlace, Place detected_place)
+{
+    float resultt = -1;
+
+    float firstPart = firstDistance;
+    float secondPart = firstDistance/secondDistance;
+    float votePercentage = 0;
+
+    std::vector<float> placeInvariant = closestPlace.meanInvariant;
+
+    float total_sum = 0;
+
+    for(int i = 0; i < closestPlace.memberInvariants.cols; i++)
+    {
+         Mat v1 = closestPlace.memberInvariants.col(i).clone();
+
+        std::vector<float> invariant = v1;
+
+        std::vector<float> result;
+        // Now we take the difference between the member and detected place invariant
+        std::transform(invariant.begin(),invariant.end(), placeInvariant.begin(),
+                       std::back_inserter(result),
+                       std::minus<float>());
+
+        // Now we get the square of the result to eliminate minuses
+        std::transform(result.begin(), result.end(), result.begin(), computeSquare);
+
+        // We are summing the elements of the result
+        float sum_of_elems =std::accumulate(result.begin(),result.end(),0.0);//#include <numeric>
+
+        sum_of_elems = sqrt(sum_of_elems);
+
+        total_sum +=sum_of_elems;
+
+
+    }
+    float radius_closest_place = total_sum/closestPlace.memberInvariants.cols;
+
+    total_sum = 0;
+
+    std::vector<float> placeInvariantDPlace = detected_place.meanInvariant;
+
+    for(int i = 0; i < detected_place.memberInvariants.cols; i++)
+    {
+        Mat v1 = detected_place.memberInvariants.col(i).clone();
+
+        std::vector<float> invariant = v1;
+
+        std::vector<float> result;
+
+        // Now we take the difference between the member and detected place invariant
+        std::transform(invariant.begin(),invariant.end(), placeInvariantDPlace.begin(),
+                       std::back_inserter(result),
+                       std::minus<float>());
+
+        // Now we get the square of the result to eliminate minuses
+        std::transform(result.begin(), result.end(), result.begin(), computeSquare);
+
+        // We are summing the elements of the result
+        float sum_of_elems =std::accumulate(result.begin(),result.end(),0.0);//#include <numeric>
+
+        sum_of_elems = sqrt(sum_of_elems);
+
+        total_sum +=sum_of_elems;
+
+
+    }
+    float radius_detected_place = total_sum/detected_place.memberInvariants.cols;
+
+ /*   std::vector<float> result;
+    // Now we take the difference between the member and detected place invariant
+    std::transform(placeInvariant.begin(),placeInvariant.end(), placeInvariantDPlace.begin(),
+                   std::back_inserter(result),
+                   std::minus<float>());
+
+    // Now we get the square of the result to eliminate minuses
+    std::transform(result.begin(), result.end(), result.begin(), computeSquare);
+
+    // We are summing the elements of the result
+    float sum_of_elems =std::accumulate(result.begin(),result.end(),0.0);
+
+    sum_of_elems = sqrt(sum_of_elems);*/
+
+    float radius_total = radius_closest_place+radius_detected_place;
+
+
+
+    float overlap = firstDistance/radius_total;
+
+    qDebug()<<"Results for overlap"<<radius_closest_place<<radius_detected_place<<firstDistance<<overlap;
+
+    //  if(DatabaseManager::openDB("/home/hakan/Development/ISL/Datasets/Own/deneme/db1.db"))
+    //  {
+    // Place aPlace = DatabaseManager::getPlace(closestPlace.id);
+
+    //  votePercentage= performKNN(closestPlace.memberInvariants,detected_place.memberInvariants);//performSVM(closestPlace.memberInvariants,detected_place.memberInvariants);
+    qDebug()<<"Vote percentage"<<votePercentage;
+
+    //  Mat trainingVector;
+
+    //  trainingVector = aPlace.memberInvariants;
+
+    //qDebug()<<trainingVector.rows<<trainingVector.cols;
+
+
+    //  DatabaseManager::closeDB();
+    // }
+
+    resultt = firstPart+secondPart+ (1-overlap);
+
+    return resultt;
+
+
+}
+
+float calculateCostFunctionv2(float firstDistance, float secondDistance, Place closestPlace, Place secondClosestPlace, Place detected_place)
+{
+    float result = -1;
+
+    float firstPart = firstDistance;
+    float secondPart = firstDistance/secondDistance;
+    float votePercentage = 0;
+
+    //  if(DatabaseManager::openDB("/home/hakan/Development/ISL/Datasets/Own/deneme/db1.db"))
+    //  {
+    // Place aPlace = DatabaseManager::getPlace(closestPlace.id);
+
+    votePercentage= performKNN(closestPlace.memberInvariants, secondClosestPlace.memberInvariants, detected_place.memberInvariants);//performSVM(closestPlace.memberInvariants,detected_place.memberInvariants);
+    qDebug()<<"Vote percentage"<<votePercentage;
+
+    //  Mat trainingVector;
+
+    //  trainingVector = aPlace.memberInvariants;
+
+    //qDebug()<<trainingVector.rows<<trainingVector.cols;
+
+
+    //  DatabaseManager::closeDB();
+    // }
+
+    result = firstPart+secondPart+(1-votePercentage);
+
+    return result;
+
+
+}
+
 float performSVM(Mat trainingVector, Mat testVector)
 {
     //  Mat trainingDataMat(4, 2, CV_32FC1, trainingData);
@@ -1339,8 +2075,8 @@ float performSVM(Mat trainingVector, Mat testVector)
     params.svm_type    = CvSVM::ONE_CLASS;
     params.kernel_type = CvSVM::RBF;
     params.gamma = (double)1.0/trainingVector.rows;
-    params.nu = 0.5;
-    params.term_crit   = cvTermCriteria(CV_TERMCRIT_ITER, 1000, 1e-6);
+    params.nu = 0.15;
+    params.term_crit   = cvTermCriteria(CV_TERMCRIT_ITER, 1000, 1e-8);
 
     // Train the SVM
     CvSVM SVM;
@@ -1368,4 +2104,53 @@ float performSVM(Mat trainingVector, Mat testVector)
 
     return result;
 
+}
+float performKNN(Mat trainingVector, Mat secondTrainingVector, Mat testVector)
+{
+    /// Initialize the knn object
+    cv::KNearest *knn;
+
+    /** ****** Transpose the training and test vectors so that the rows correspond the samples and cols correspond to features ********/
+    cv::transpose(trainingVector,trainingVector);
+
+    cv::transpose(secondTrainingVector,secondTrainingVector);
+
+    cv::transpose(testVector,testVector);
+    /** ********************************************************************************************************************************/
+
+    /** ********************Prepare the Label Vectors************************************************/
+    Mat labelsMat = Mat::ones(trainingVector.rows,1,CV_32FC1);
+
+    Mat labelsMat2 = Mat::ones(secondTrainingVector.rows,1,CV_32FC1);
+
+    labelsMat2 = 2*labelsMat2;
+    /** **********************************************************************************************/
+
+
+    /** *************** Concatenate the training and label vectors ***********************************/
+    Mat wholetrainingVector;
+
+    cv::vconcat(trainingVector,secondTrainingVector,wholetrainingVector);
+
+    Mat wholeLabelVector;
+
+    cv::vconcat(labelsMat,labelsMat2,wholeLabelVector);
+    /** **********************************************************************************************/
+
+
+    /** ***************Perform KNN classification *************************/
+
+    knn = new KNearest(wholetrainingVector, wholeLabelVector);
+
+    float summ = 0;
+    for(int i = 0; i< testVector.rows; i++)
+    {
+
+
+        float res =  knn->find_nearest(testVector.row(i),5);
+        if(res == 1)
+            summ+=1;
+    }
+    /** ************************************************************/
+    return (float)summ/testVector.rows;
 }

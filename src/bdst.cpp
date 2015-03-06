@@ -2,6 +2,7 @@
 
 Level::Level()
 {
+    val = 0.0;
 }
 Level::~Level()
 {
