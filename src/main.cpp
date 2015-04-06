@@ -89,7 +89,7 @@ double** calculateDistanceMatrix(int nrows, int ncols, double** data, int** mask
 // Calculates the cost function based on the first closest, second closest as well as the SVM results
 float calculateCostFunction(float firstDistance, float secondDistance, Place closestPlace, Place detected_place);
 
-float calculateCostFunctionv3(float firstDistance, float secondDistance, Place closestPlace, Place detected_place);
+float calculateCostFunctionv3(float firstDistance, float secondDistance, LearnedPlace closestPlace, Place detected_place);
 
 
 // Train the SVM classifier
@@ -111,6 +111,8 @@ Node* calculateBinaryBDST(int nrows, int ncols, double** data);
 
 // Binary den Merged bdst'ye gecis
 void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST* bdst);
+
+void calculateMergedBDSTv2(float tau_h, int nnodes, int noplaces, Node* tree, BDST* bdst);
 
 // Calculate the mean invariants so that the robot can perform recognition
 void calculateMeanInvariantsOfBDST(BDST* aLevel);
@@ -305,6 +307,32 @@ void mainFilePathCallback(std_msgs::String mainfp)
     if(knowledgedbmanager.openDB(knowledge_dbpath,"knowledge"))
     {
         qDebug()<<"Knowledge db opened";
+
+        if(knowledgedbmanager.getLearnedPlaceMaxID() == 0)
+        {
+            qDebug()<<"Starting with empty knowledge";
+        }
+        else
+        {
+            int previousKnowledgeSize = knowledgedbmanager.getLearnedPlaceMaxID();
+
+            qDebug()<<"Starting with previous knowledge. Previous number of places: "<<previousKnowledgeSize;
+
+            learnedPlaceCounter = previousKnowledgeSize+1;
+
+            for(int i = 1; i <= previousKnowledgeSize; i++)
+            {
+                LearnedPlace aPlace = knowledgedbmanager.getLearnedPlace(i);
+
+                places.push_back(aPlace);
+            }
+
+            constructInvariantsMatrix(places);
+            performBDSTCalculations();
+
+            //knowledgedbmanager.get
+        }
+
     }
 
     QString processingPerImageFilePath = mainFilePath;
@@ -626,7 +654,9 @@ void performBDSTCalculations()
 
     bdst =  new BDST;
 
-    calculateMergedBDST(tau_h,nrows-1,nrows,binarytree,bdst);
+   // calculateMergedBDST(tau_h,nrows-1,nrows,binarytree,bdst);
+
+     calculateMergedBDSTv2(tau_h,nrows-1,nrows,binarytree,bdst);
 
     free(binarytree);
 
@@ -757,6 +787,269 @@ Node* calculateBinaryBDST(int nrows, int ncols, double** data)
     return NULL;
 
 }
+void calculateMergedBDSTv2(float tau_h, int nnodes, int noplaces, Node* tree, BDST* bdst)
+{
+    //int levelcount = 0;
+    //int nodecount = 0;
+
+    std::vector<TreeLeaf> leaves;
+
+    QString homepath = mainFilePath;
+
+    if(homepath.isEmpty())
+    {
+        homepath = QDir::homePath();
+    }
+
+    homepath.append("/mergedbdst.txt");
+
+    QFile file(homepath);
+    if(file.open(QFile::WriteOnly))
+    {
+        qDebug()<<"BDST File is opened for writing";
+
+    }
+
+    QTextStream txtstr(&file);
+    // BDST bdst;
+
+    //  bdst.levels.resize(1);
+
+    // places start from 0 to
+
+    // These are the initial leaves, we will merge them
+    for(int i = 0 ; i < nnodes; i++)
+    {
+        TreeLeaf leaf;
+
+        // The left child
+        leaf.left = tree[i].left;
+
+        // If left child is less than 0 that means it is an inner node. MATLAB implementation uses positive index so we switch the index to positive
+        if(leaf.left < 0) leaf.left=noplaces-leaf.left;
+
+        // The right child
+        leaf.right = tree[i].right;
+
+        // If right child is less than 0 that means it is an inner node. MATLAB implementation uses positive index so we switch the index to positive
+        if(leaf.right < 0) leaf.right=noplaces-leaf.right;
+
+        // The value of the leaf
+        leaf.val = tree[i].distance;
+        // qDebug()<<"Tree distance"<<leaf.val;
+
+        // While building merged BDST we check whether the leaf is used or not
+        leaf.isused = false;
+
+        // Each leaf has a connection to the parent node. It is marked by this variable
+        leaf.parentConnection = noplaces+i+1;
+
+        leaves.push_back(leaf);
+
+    }
+
+    // Merging starts here
+    for(uint i = 0; i < leaves.size(); i++)
+    {
+        TreeLeaf aLeaf = leaves[i];
+        qDebug()<<"Leaf"<<aLeaf.left<<aLeaf.right<<aLeaf.isused;
+
+        // qDebug()<<"i is"<<i;
+
+        // The leaf has been unused we should check the perimeter
+        if(!aLeaf.isused)
+        {
+             Level aLevel;
+
+             aLevel.members.push_back(aLeaf.left);
+             aLevel.members.push_back(aLeaf.right);
+
+             aLevel.parentNodes.push_back(aLeaf.parentConnection);
+
+             aLevel.val = aLeaf.val + tau_h;
+
+             leaves[i].isused = true;
+
+
+
+             if(aLeaf.right < noplaces && aLeaf.left < noplaces)
+                 txtstr<<aLeaf.left+1<<" "<<aLeaf.right+1<<" "<<aLeaf.val+tau_h<<" "<<"\n";
+             else if(aLeaf.right < noplaces)
+                 txtstr<<aLeaf.left<<" "<<aLeaf.right+1<<" "<<aLeaf.val+tau_h<<" "<<"\n";
+             else if(aLeaf.left < noplaces)
+                 txtstr<<aLeaf.left+1<<" "<<aLeaf.right<<" "<<aLeaf.val+tau_h<<" "<<"\n";
+             else
+                 txtstr<<aLeaf.left<<" "<<aLeaf.right<<" "<<aLeaf.val+tau_h<<" "<<"\n";
+
+
+
+             // We are looking for the following leaves
+             for(uint k = i ; k < leaves.size(); k++)
+             {
+                 // The leaf should be unused and the value should be less than level value
+                 if(!leaves[k].isused && leaves[k].val <= aLevel.val)
+                 {
+                     if(aLeaf.parentConnection == leaves[k].left && leaves[k].right > noplaces)
+                     {
+
+                       //  aLevel.parentNodes.push_back(leaves[k].left);
+                         aLevel.parentNodes.push_back(leaves[k].right);
+
+                     }
+                     else if(aLeaf.parentConnection == leaves[k].left && leaves[k].right < noplaces)
+                     {
+
+                         //  aLevel.parentNodes.push_back(leaves[k].left);
+                         aLevel.members.push_back(leaves[k].right);
+
+                     }
+                     else if(aLeaf.parentConnection == leaves[k].right && leaves[k].left > noplaces)
+                     {
+                         aLevel.parentNodes.push_back(leaves[k].left);
+                     }
+                     else if(aLeaf.parentConnection == leaves[k].right && leaves[k].left < noplaces)
+                     {
+                         aLevel.members.push_back(leaves[k].left);
+
+                     }
+
+
+                     if(aLeaf.parentConnection == leaves[k].right || aLeaf.parentConnection == leaves[k].left )
+                     {
+                         leaves[k].isused = true;
+
+                        aLevel.parentNodes.push_back(leaves[k].parentConnection);
+
+                        if(leaves[k].right < noplaces && leaves[k].left < noplaces)
+                            txtstr<<leaves[k].left+1<<" "<<leaves[k].right+1<<" "<<aLevel.val<<" "<<"\n";
+                        else if(leaves[k].right < noplaces)
+                            txtstr<<leaves[k].left<<" "<<leaves[k].right+1<<" "<<aLevel.val<<" "<<"\n";
+                        else if(leaves[k].left < noplaces)
+                            txtstr<<leaves[k].left+1<<" "<<leaves[k].right<<" "<<aLevel.val<<" "<<"\n";
+                        else
+                            txtstr<<leaves[k].left<<" "<<leaves[k].right<<" "<<aLevel.val<<" "<<"\n";
+
+                        aLeaf.parentConnection = leaves[k].parentConnection;
+                     }
+
+
+                 }
+             }
+             // We are looking for the following leaves second time
+             for(uint k = i ; k < leaves.size(); k++)
+             {
+                 if(!leaves[k].isused && leaves[k].val <= aLevel.val)
+                 {
+                    // I have found the parent connection so I should add this to leaf to the current level
+                     if(std::find(aLevel.parentNodes.begin(), aLevel.parentNodes.end(), leaves[k].parentConnection)!=aLevel.parentNodes.end())
+                     {
+                          aLevel.members.push_back(leaves[k].right);
+                          aLevel.members.push_back(leaves[k].left);
+
+                          leaves[k].isused = true;
+
+                          if(leaves[k].right < noplaces && leaves[k].left < noplaces)
+                              txtstr<<leaves[k].left+1<<" "<<leaves[k].right+1<<" "<<aLevel.val<<" "<<"\n";
+                          else if(leaves[k].right < noplaces)
+                              txtstr<<leaves[k].left<<" "<<leaves[k].right+1<<" "<<aLevel.val<<" "<<"\n";
+                          else if(leaves[k].left < noplaces)
+                              txtstr<<leaves[k].left+1<<" "<<leaves[k].right<<" "<<aLevel.val<<" "<<"\n";
+                          else
+                              txtstr<<leaves[k].left<<" "<<leaves[k].right<<" "<<aLevel.val<<" "<<"\n";
+
+
+                     }
+                 }
+
+             }
+
+
+               bdst->levels.append(aLevel);
+        }
+
+
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+//    // Merging starts here
+//    for(uint i = 0; i < leaves.size(); i++)
+//    {
+//        if(!leaves.at(i).isused)
+//        {
+//            for(int j = 0; j < bdst->levels.size(); j++)
+//            {
+//                if(fabs(bdst->levels.at(j).val-leaves.at(i).val) <= tau_h)
+//                {
+//                    TreeLeaf aLeaf = leaves[i];
+
+//                    aLeaf.isused = true;
+
+//                    if(aLeaf.left < noplaces)
+//                    {
+//                        bdst->levels[j].members.push_back(aLeaf.left);
+
+//                    }
+//                    else if(aLeaf.left > noplaces)
+//                    {
+//                        bdst->levels[j].parentNodes.push_back(aLeaf.left);
+
+//                    }
+//                    if(aLeaf.right < noplaces)
+//                    {
+//                        bdst->levels[j].members.push_back(aLeaf.right);
+
+//                    }
+//                    else if(aLeaf.right > noplaces)
+//                    {
+//                        bdst->levels[j].parentNodes.push_back(aLeaf.right);
+
+//                    }
+
+//                    if(aLeaf.right < noplaces && aLeaf.left < noplaces)
+//                        txtstr<<aLeaf.left+1<<" "<<aLeaf.right+1<<" "<<bdst->levels[j].val<<" "<<"\n";
+//                    else if(aLeaf.right < noplaces)
+//                        txtstr<<aLeaf.left<<" "<<aLeaf.right+1<<" "<<bdst->levels[j].val<<" "<<"\n";
+//                    else if(aLeaf.left < noplaces)
+//                        txtstr<<aLeaf.left+1<<" "<<aLeaf.right<<" "<<bdst->levels[j].val<<" "<<"\n";
+
+//                    leaves[i] = aLeaf;
+
+//                }
+//            }
+//        }
+//    }
+
+    for(int j = 0; j < bdst->levels.size(); j++)
+    {
+        bdst->levels[j].connectionIndex = *std::max_element(bdst->levels.at(j).parentNodes.begin(),bdst->levels.at(j).parentNodes.end());
+
+
+
+
+        // calculateMeanInvariantForBDSTLevel( &bdst->levels[j]);
+
+    }
+
+    calculateMeanInvariantsOfBDST( bdst);
+
+    file.close();
+
+    qDebug()<<"Finished";
+
+
+
+
+}
 void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST* bdst)
 {
     //int levelcount = 0;
@@ -832,7 +1125,7 @@ void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST
             bool shouldADDLevel = true;
 
             // TODO
-            qDebug()<<"Lastly i am here"<<bdst->levels.size();
+          //  qDebug()<<"Lastly i am here"<<bdst->levels.size();
 
             if(bdst->levels.size() > 0)
             {
@@ -887,6 +1180,7 @@ void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST
 
                         }
 
+
                     }
 
                     if(!shouldADDLevel)
@@ -927,12 +1221,17 @@ void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST
 
                 for(uint j = 0; j < leaves.size(); j++)
                 {
+                    qDebug()<<"Leaf :"<<leaves[j].right<<leaves[j].left<<leaves[j].parentConnection<<leaves[j].isused<<currentConnection;
+
+
                     // If the leaf is not used && and left member of the leaf is equal to the current connection && the value is in the range
                     if(!leaves[j].isused && leaves.at(j).left == currentConnection && leaves.at(j).val <= aLevel.val)
                     {
                         if(leaves[j].right < noplaces)
                         {
                             aLevel.members.push_back(leaves[j].right);
+                            aLevel.parentNodes.push_back(leaves[j].left);
+
 
                             txtstr<<leaves[j].left<<" "<<leaves[j].right+1<<" "<<aLevel.val<<"\n";
 
@@ -940,17 +1239,29 @@ void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST
 
 
                         }
-                        else
+                       /* else if(leaves[j].left < noplaces)
                         {
+                             aLevel.members.push_back(leaves[j].left);
                             aLevel.parentNodes.push_back(leaves[j].right);
 
-                            txtstr<<leaves[j].left<<" "<<leaves[j].right<<" "<<aLevel.val<<"\n";
+                            txtstr<<leaves[j].left+1<<" "<<leaves[j].right<<" "<<aLevel.val<<"\n";
 
+
+                        }*/
+                        else
+                        {
+
+                            aLevel.parentNodes.push_back(leaves[j].right);
+
+
+                            txtstr<<leaves[j].left+1<<" "<<leaves[j].right+1<<" "<<aLevel.val<<"\n";
 
                         }
 
 
                         leaves[j].isused = true;
+                        aLevel.parentNodes.push_back(leaves[j].left);
+
                         aLevel.parentNodes.push_back(leaves[j].parentConnection);
 
                         currentConnection = leaves[j].parentConnection;
@@ -979,6 +1290,7 @@ void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST
 
                         }
 
+                        aLevel.parentNodes.push_back(leaves.at(j).right);
                         aLevel.parentNodes.push_back(leaves[j].parentConnection);
 
 
@@ -994,6 +1306,8 @@ void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST
                     // There is no connection index in this leaf. We should investigate further
                     else if(!leaves[j].isused  && leaves.at(j).val <= aLevel.val)
                     {
+                        qDebug()<<"Leaf under investigation :"<<leaves[j].right<<leaves[j].left;
+
                         for(uint ll = j+1; ll < leaves.size(); ll++ )
                         {
                             // If we find the connection leaf
@@ -1044,6 +1358,9 @@ void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST
 
                                     txtstr<<leaves[ll].left<<" "<<leaves[ll].right<<" "<<aLevel.val<<"\n";
 
+                                    aLevel.parentNodes.push_back(leaves[ll].left);
+                                    aLevel.parentNodes.push_back(leaves[ll].right);
+
                                     leaves[ll].isused = true;
                                     leaves[j].isused = true;
                                     currentConnection = leaves[ll].parentConnection;
@@ -1085,6 +1402,7 @@ void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST
 
                                     else if(leaves[j].left < noplaces)
                                     {
+                                        aLevel.parentNodes.push_back(leaves[j].right);
                                         aLevel.members.push_back(leaves[j].left);
 
 
@@ -1104,6 +1422,9 @@ void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST
                                     }
 
                                     txtstr<<leaves[ll].left<<" "<<leaves[ll].right<<" "<<aLevel.val<<"\n";
+
+                                    aLevel.parentNodes.push_back(leaves[ll].left);
+                                    aLevel.parentNodes.push_back(leaves[ll].right);
 
                                     leaves[ll].isused = true;
                                     leaves[j].isused = true;
@@ -1154,9 +1475,58 @@ void calculateMergedBDST(float tau_h, int nnodes, int noplaces, Node* tree, BDST
 
     }
 
+//    // Merging starts here
+//    for(uint i = 0; i < leaves.size(); i++)
+//    {
+//        if(!leaves.at(i).isused)
+//        {
+//            for(int j = 0; j < bdst->levels.size(); j++)
+//            {
+//                if(fabs(bdst->levels.at(j).val-leaves.at(i).val) <= tau_h)
+//                {
+//                    TreeLeaf aLeaf = leaves[i];
+
+//                    aLeaf.isused = true;
+
+//                    if(aLeaf.left < noplaces)
+//                    {
+//                        bdst->levels[j].members.push_back(aLeaf.left);
+
+//                    }
+//                    else if(aLeaf.left > noplaces)
+//                    {
+//                        bdst->levels[j].parentNodes.push_back(aLeaf.left);
+
+//                    }
+//                    if(aLeaf.right < noplaces)
+//                    {
+//                        bdst->levels[j].members.push_back(aLeaf.right);
+
+//                    }
+//                    else if(aLeaf.right > noplaces)
+//                    {
+//                        bdst->levels[j].parentNodes.push_back(aLeaf.right);
+
+//                    }
+
+//                    if(aLeaf.right < noplaces && aLeaf.left < noplaces)
+//                        txtstr<<aLeaf.left+1<<" "<<aLeaf.right+1<<" "<<bdst->levels[j].val<<" "<<"\n";
+//                    else if(aLeaf.right < noplaces)
+//                        txtstr<<aLeaf.left<<" "<<aLeaf.right+1<<" "<<bdst->levels[j].val<<" "<<"\n";
+//                    else if(aLeaf.left < noplaces)
+//                        txtstr<<aLeaf.left+1<<" "<<aLeaf.right<<" "<<bdst->levels[j].val<<" "<<"\n";
+
+//                    leaves[i] = aLeaf;
+
+//                }
+//            }
+//        }
+//    }
+
     for(int j = 0; j < bdst->levels.size(); j++)
     {
-        bdst->levels[j].connectionIndex = bdst->levels.at(j).parentNodes.back();
+        bdst->levels[j].connectionIndex = *std::max_element(bdst->levels.at(j).parentNodes.begin(),bdst->levels.at(j).parentNodes.end());
+
 
 
 
@@ -1642,7 +2012,7 @@ int performTopDownBDSTRecognition(float tau_g, float tau_l, BDST *bdst, Place de
 
             distpairs.push_back(distpair);
 
-            qDebug()<<"Distance result: "<<sum_of_elems<<aMember;
+          //  qDebug()<<"Distance result: "<<sum_of_elems<<aMember;
 
         }
 
@@ -1676,14 +2046,16 @@ int performTopDownBDSTRecognition(float tau_g, float tau_l, BDST *bdst, Place de
             //  if(dbmanager.openDB("/home/hakan/Development/ISL/Datasets/Own/deneme/db1.db"))
             //   {
 
-            Place aPlace = dbmanager.getPlace((firstClosestMember.second+1));
+            LearnedPlace aPlace = dbmanager.getLearnedPlace(firstClosestMember.second+1);//dbmanager.getPlace((firstClosestMember.second+1));
 
             float costValue = 100.0;
 
             if(secondClosestMember.second < invariants.size())
             {
 
-                Place aPlace2 = dbmanager.getPlace((secondClosestMember.second+1));
+                LearnedPlace aPlace2 = dbmanager.getLearnedPlace(secondClosestMember.second+1);//dbmanager.getPlace((secondClosestMember.second+1));
+
+
                 costValue = calculateCostFunctionv3(firstClosestMember.first,secondClosestMember.first,aPlace,detected_place);
                // costValue = calculateCostFunctionv2(firstClosestMember.first,secondClosestMember.first,aPlace,aPlace2,detected_place);
             }
@@ -1818,7 +2190,7 @@ float CvSVM::predict( const CvMat* sample, bool returnDFVal ) const
 }*/
 void calculateMeanInvariantsOfBDST(BDST *bdst)
 {
-    for(int j =0 ; j < bdst->levels.size()-1; j++){
+    for(int j =0 ; j < bdst->levels.size(); j++){
 
         Level* aLevel = &bdst->levels[j];
 
@@ -1876,6 +2248,7 @@ void calculateMeanInvariantsOfBDST(BDST *bdst)
         }
 
         aLevel->meanInvariant = sum;
+
     }
 
 }
@@ -1911,7 +2284,7 @@ float calculateCostFunction(float firstDistance, float secondDistance, Place clo
 
 
 }
-float calculateCostFunctionv3(float firstDistance, float secondDistance, Place closestPlace, Place detected_place)
+float calculateCostFunctionv3(float firstDistance, float secondDistance, LearnedPlace closestPlace, Place detected_place)
 {
     float resultt = -1;
 
@@ -2007,7 +2380,7 @@ float calculateCostFunctionv3(float firstDistance, float secondDistance, Place c
     // Place aPlace = DatabaseManager::getPlace(closestPlace.id);
 
     //  votePercentage= performKNN(closestPlace.memberInvariants,detected_place.memberInvariants);//performSVM(closestPlace.memberInvariants,detected_place.memberInvariants);
-    qDebug()<<"Vote percentage"<<votePercentage;
+   // qDebug()<<"Vote percentage"<<votePercentage;
 
     //  Mat trainingVector;
 
